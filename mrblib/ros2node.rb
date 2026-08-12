@@ -4,9 +4,9 @@ module ROS2
       String => :string
     }
 
-    def initialize(name, uart)
-      # TODO: build transport from uart, uxr_create_session, create participant
-    end
+    # #initialize is defined in src/ros2node.c: it wires the given
+    # picoruby-uart UART into a Micro-XRCE-DDS-Client custom transport and
+    # establishes the session.
 
     def publish(topic, msg)
       type = TYPE_MAP[msg.class]

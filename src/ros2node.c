@@ -1,11 +1,9 @@
-#include <mruby.h>
+#if defined(PICORB_VM_MRUBY)
 
-void
-mrb_picoruby_ros2node_gem_init(mrb_state* mrb)
-{
-}
+#include "mruby/ros2node.c"
 
-void
-mrb_picoruby_ros2node_gem_final(mrb_state* mrb)
-{
-}
+#elif defined(PICORB_VM_MRUBYC)
+
+#include "mrubyc/ros2node.c"
+
+#endif
