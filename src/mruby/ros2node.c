@@ -11,11 +11,23 @@
 
 #include <uxr/client/client.h>
 #include <uxr/client/util/time.h>
+#include <ucdr/microcdr.h>
 
 typedef enum {
   ROS2NODE_IO_UART, /* byte stream, e.g. picoruby-uart UART */
   ROS2NODE_IO_UDP   /* datagram, e.g. picoruby-socket UDPSocket */
 } ros2node_io_kind;
+
+/* Reliable stream buffers: MTU (custom-transport, see uxr_config.h) x
+ * history slots, both directions. A reliable *input* stream is required
+ * even though we never read application data off it ourselves: replies to
+ * reliable-output traffic (STATUS for create-entities, ACKNACK bookkeeping)
+ * are processed via the reliable-input path, and a best-effort-only input
+ * left that path's internal buffer sizing at zero, which crashed with a
+ * divide-by-zero (uxr_get_reliable_buffer_size) the first time the agent's
+ * reply needed it -- see the tracking issue for the panic report. */
+#define ROS2NODE_STREAM_HISTORY 4
+#define ROS2NODE_STREAM_BUFFER_SIZE (UXR_CONFIG_CUSTOM_TRANSPORT_MTU * ROS2NODE_STREAM_HISTORY)
 
 typedef struct {
   mrb_state *mrb;
@@ -23,6 +35,13 @@ typedef struct {
   ros2node_io_kind io_kind;
   uxrCustomTransport transport;
   uxrSession session;
+  uxrStreamId reliable_out;
+  uxrStreamId reliable_in;
+  uxrObjectId participant_id;
+  uxrObjectId publisher_id;
+  uint16_t next_object_id; /* next free id in the topic/datawriter namespaces; 1 is the participant/publisher */
+  uint8_t output_buffer[ROS2NODE_STREAM_BUFFER_SIZE];
+  uint8_t input_buffer[ROS2NODE_STREAM_BUFFER_SIZE];
 } ros2node_data_t;
 
 static void
@@ -161,7 +180,97 @@ mrb_ros2node_initialize(mrb_state *mrb, mrb_value self)
     mrb_raise(mrb, E_RUNTIME_ERROR, "ROS2::Node: failed to create session with agent");
   }
 
+  data->reliable_out = uxr_create_output_reliable_stream(&data->session, data->output_buffer,
+      sizeof(data->output_buffer), ROS2NODE_STREAM_HISTORY);
+  data->reliable_in = uxr_create_input_reliable_stream(&data->session, data->input_buffer,
+      sizeof(data->input_buffer), ROS2NODE_STREAM_HISTORY);
+
+  /* A Node is one DDS Participant with one Publisher shared by every topic
+   * it ends up publishing to (id 1 in both namespaces); each publish()'d
+   * topic then gets its own Topic+DataWriter pair, allocated from
+   * next_object_id starting at 2. Created eagerly here (rather than lazily
+   * on first publish) since every Node needs a participant regardless. */
+  data->next_object_id = 2;
+  data->participant_id = uxr_object_id(1, UXR_PARTICIPANT_ID);
+  data->publisher_id = uxr_object_id(1, UXR_PUBLISHER_ID);
+
+  uint16_t participant_req = uxr_buffer_create_participant_bin(&data->session, data->reliable_out,
+      data->participant_id, 0, mrb_string_value_cstr(mrb, &name), UXR_REPLACE);
+  uint16_t publisher_req = uxr_buffer_create_publisher_bin(&data->session, data->reliable_out,
+      data->publisher_id, data->participant_id, UXR_REPLACE);
+
+  uint16_t requests[2] = { participant_req, publisher_req };
+  uint8_t status[2];
+  if (!uxr_run_session_until_all_status(&data->session, 1000, requests, status, 2)) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "ROS2::Node: failed to create participant/publisher");
+  }
+
   return self;
+}
+
+/* topic_name/type_name are the DDS-wire names (e.g. "rt/chatter",
+ * "std_msgs::msg::dds_::String_") -- mrblib is responsible for the ROS2
+ * name-mangling, this layer just creates the entities. Returns the
+ * DataWriter's uxrObjectId packed into a Fixnum ((id << 8) | type) for
+ * mrblib to hold onto and pass back into #_write_string et al. */
+static mrb_value
+mrb_ros2node_create_publisher(mrb_state *mrb, mrb_value self)
+{
+  ros2node_data_t *data = (ros2node_data_t *)mrb_data_get_ptr(mrb, self, &ros2node_data_type);
+  mrb_value topic_name, type_name;
+  mrb_get_args(mrb, "SS", &topic_name, &type_name);
+
+  uint16_t n = data->next_object_id++;
+  uxrObjectId topic_id = uxr_object_id(n, UXR_TOPIC_ID);
+  uxrObjectId datawriter_id = uxr_object_id(n, UXR_DATAWRITER_ID);
+
+  uint16_t topic_req = uxr_buffer_create_topic_bin(&data->session, data->reliable_out, topic_id,
+      data->participant_id, mrb_string_value_cstr(mrb, &topic_name), mrb_string_value_cstr(mrb, &type_name),
+      UXR_REPLACE);
+
+  /* Matches rclcpp's default publisher QoS (reliable/volatile/keep_last-10)
+   * so a plain `ros2 topic echo` subscriber is compatible out of the box. */
+  uxrQoS_t qos = {
+    .durability = UXR_DURABILITY_VOLATILE,
+    .reliability = UXR_RELIABILITY_RELIABLE,
+    .history = UXR_HISTORY_KEEP_LAST,
+    .depth = 10,
+  };
+  uint16_t datawriter_req = uxr_buffer_create_datawriter_bin(&data->session, data->reliable_out, datawriter_id,
+      data->publisher_id, topic_id, qos, UXR_REPLACE);
+
+  uint16_t requests[2] = { topic_req, datawriter_req };
+  uint8_t status[2];
+  if (!uxr_run_session_until_all_status(&data->session, 1000, requests, status, 2)) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "ROS2::Node: failed to create publisher");
+  }
+
+  return mrb_fixnum_value(((mrb_int)datawriter_id.id << 8) | datawriter_id.type);
+}
+
+/* Serializes str as a CDR string (uint32 length prefix + bytes + NUL) and
+ * writes it to the DataWriter identified by the packed id #_create_publisher
+ * returned. Best-effort from our side too: send now, don't wait for the
+ * agent's delivery ack (that'll matter once #spin_once exists to pump
+ * incoming heartbeats/acks for the reliable stream -- see Risks in the
+ * tracking issue). */
+static mrb_value
+mrb_ros2node_write_string(mrb_state *mrb, mrb_value self)
+{
+  ros2node_data_t *data = (ros2node_data_t *)mrb_data_get_ptr(mrb, self, &ros2node_data_type);
+  mrb_int packed;
+  mrb_value str;
+  mrb_get_args(mrb, "iS", &packed, &str);
+
+  uxrObjectId datawriter_id = uxr_object_id((uint16_t)(packed >> 8), (uint8_t)(packed & 0xFF));
+
+  ucdrBuffer ub;
+  uint32_t size = 4 + (uint32_t)RSTRING_LEN(str) + 1;
+  uxr_prepare_output_stream(&data->session, data->reliable_out, datawriter_id, &ub, size);
+  ucdr_serialize_string(&ub, mrb_string_value_cstr(mrb, &str));
+  uxr_flash_output_streams(&data->session);
+
+  return ub.error ? mrb_false_value() : mrb_true_value();
 }
 
 void
@@ -172,6 +281,8 @@ mrb_picoruby_ros2node_gem_init(mrb_state* mrb)
   MRB_SET_INSTANCE_TT(class_Node, MRB_TT_CDATA);
 
   mrb_define_method_id(mrb, class_Node, MRB_SYM(initialize), mrb_ros2node_initialize, MRB_ARGS_REQ(2));
+  mrb_define_method_id(mrb, class_Node, MRB_SYM(_create_publisher), mrb_ros2node_create_publisher, MRB_ARGS_REQ(2));
+  mrb_define_method_id(mrb, class_Node, MRB_SYM(_write_string), mrb_ros2node_write_string, MRB_ARGS_REQ(2));
 }
 
 void
