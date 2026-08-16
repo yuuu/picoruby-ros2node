@@ -53,6 +53,28 @@ module ROS2
       @callbacks[reader] = block
     end
 
+    # Opt-in, self-contained alternative to calling #spin_once in a loop by
+    # hand: spawns a background Task that does exactly that, so #subscribe
+    # callbacks keep firing without the caller giving up its own thread of
+    # control. Deliberately does NOT touch R2P2-ESP32's main_task.rb --
+    # that file is shared by every R2P2 user regardless of ros2node, and a
+    # per-Node Task (mirroring how picoruby-irq spawns its own dispatcher
+    # task) needs no central registry of "active nodes" the way hooking
+    # main_task.rb's loop would. Idempotent: a second call returns the
+    # already-running task instead of spawning another.
+    #
+    # Note this differs from rclcpp/rclpy's `spin`, which blocks the
+    # calling thread forever -- this one returns immediately and does its
+    # work in the background task instead.
+    def spin(interval_ms = 100)
+      node = self # Task blocks run with self == main, not the lexical
+                   # self, so #spin_once below must have an explicit
+                   # receiver or it would NoMethodError against `main`.
+      @spin_task ||= Task.new(name: "ros2node_spin") do
+        loop { node.spin_once(interval_ms) }
+      end
+    end
+
     # Called by #spin_once (ros2node.c) after each uxr_run_session_timeout;
     # not meant to be called directly.
     def _dispatch_pending
