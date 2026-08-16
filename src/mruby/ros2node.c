@@ -31,6 +31,7 @@ typedef enum {
 
 typedef struct {
   mrb_state *mrb;
+  mrb_value self; /* the ROS2::Node wrapping this struct; used by ros2node_on_topic */
   mrb_value io;
   ros2node_io_kind io_kind;
   uxrCustomTransport transport;
@@ -39,7 +40,9 @@ typedef struct {
   uxrStreamId reliable_in;
   uxrObjectId participant_id;
   uxrObjectId publisher_id;
-  uint16_t next_object_id; /* next free id in the topic/datawriter namespaces; 1 is the participant/publisher */
+  uxrObjectId subscriber_id; /* only valid once has_subscriber is true */
+  bool has_subscriber;
+  uint16_t next_object_id; /* next free id in the topic/datawriter/datareader namespaces; 1 is the participant/publisher/subscriber */
   uint8_t output_buffer[ROS2NODE_STREAM_BUFFER_SIZE];
   uint8_t input_buffer[ROS2NODE_STREAM_BUFFER_SIZE];
 } ros2node_data_t;
@@ -121,6 +124,34 @@ ros2node_transport_read(uxrCustomTransport *transport, uint8_t *buf, size_t len,
   }
 }
 
+/* Fires (from deep inside Micro-XRCE-DDS-Client's own call stack, via
+ * #spin_once -> uxr_run_session_timeout -> listen_message -> ...) whenever
+ * a DATA submessage arrives for one of our DataReaders. Deliberately does
+ * nothing but a C-level array push here -- no mrb_funcall, no Ruby method
+ * dispatch that could raise and longjmp back out through this C library's
+ * frames, which do not expect to unwind mid-callback. The actual
+ * #subscribe block is invoked later, by #spin_once itself, once
+ * uxr_run_session_timeout has returned to safe (non-nested) ground. */
+static void
+ros2node_on_topic(uxrSession *session, uxrObjectId object_id, uint16_t request_id,
+    uxrStreamId stream_id, struct ucdrBuffer *ub, uint16_t length, void *args)
+{
+  (void)session; (void)request_id; (void)stream_id; (void)length;
+  ros2node_data_t *data = (ros2node_data_t *)args;
+  mrb_state *mrb = data->mrb;
+
+  char buf[256];
+  if (!ucdr_deserialize_string(ub, buf, sizeof(buf))) return;
+
+  mrb_value pending = mrb_iv_get(mrb, data->self, MRB_IVSYM(pending));
+  if (!mrb_array_p(pending)) return;
+
+  mrb_value pair = mrb_ary_new_capa(mrb, 2);
+  mrb_ary_push(mrb, pair, mrb_fixnum_value(((mrb_int)object_id.id << 8) | object_id.type));
+  mrb_ary_push(mrb, pair, mrb_str_new_cstr(mrb, buf));
+  mrb_ary_push(mrb, pending, pair);
+}
+
 /* Session keys must be unique per client at the agent; derive one from the
  * node name (FNV-1a) instead of requiring the caller to pick one. */
 static uint32_t
@@ -155,6 +186,7 @@ mrb_ros2node_initialize(mrb_state *mrb, mrb_value self)
   ros2node_data_t *data = (ros2node_data_t *)mrb_malloc(mrb, sizeof(ros2node_data_t));
   memset(data, 0, sizeof(ros2node_data_t));
   data->mrb = mrb;
+  data->self = self;
   data->io = io;
   data->io_kind = io_kind;
 
@@ -163,6 +195,8 @@ mrb_ros2node_initialize(mrb_state *mrb, mrb_value self)
 
   /* Keeps io reachable for the GC independently of our own struct. */
   mrb_iv_set(mrb, self, MRB_IVSYM(io), io);
+  /* Drained by #spin_once, filled by ros2node_on_topic; see its comment. */
+  mrb_iv_set(mrb, self, MRB_IVSYM(pending), mrb_ary_new(mrb));
 
   /* Byte streams (UART) need COBS-style framing to find message
    * boundaries; datagrams (UDP) are already one message per packet. */
@@ -176,6 +210,7 @@ mrb_ros2node_initialize(mrb_state *mrb, mrb_value self)
 
   uint32_t key = ros2node_key_from_name(RSTRING_PTR(name), RSTRING_LEN(name));
   uxr_init_session(&data->session, &data->transport.comm, key);
+  uxr_set_topic_callback(&data->session, ros2node_on_topic, data);
   if (!uxr_create_session(&data->session)) {
     mrb_raise(mrb, E_RUNTIME_ERROR, "ROS2::Node: failed to create session with agent");
   }
@@ -251,9 +286,10 @@ mrb_ros2node_create_publisher(mrb_state *mrb, mrb_value self)
 /* Serializes str as a CDR string (uint32 length prefix + bytes + NUL) and
  * writes it to the DataWriter identified by the packed id #_create_publisher
  * returned. Best-effort from our side too: send now, don't wait for the
- * agent's delivery ack (that'll matter once #spin_once exists to pump
- * incoming heartbeats/acks for the reliable stream -- see Risks in the
- * tracking issue). */
+ * agent's delivery ack. #spin_once now exists and pumps the reliable
+ * stream's heartbeats/acks when called, but publish() itself still doesn't
+ * block on delivery confirmation -- see Risks in the tracking issue for
+ * the sustained-pub/sub-traffic caveat this implies. */
 static mrb_value
 mrb_ros2node_write_string(mrb_state *mrb, mrb_value self)
 {
@@ -273,6 +309,82 @@ mrb_ros2node_write_string(mrb_state *mrb, mrb_value self)
   return ub.error ? mrb_false_value() : mrb_true_value();
 }
 
+/* topic_name/type_name are the DDS-wire names, same convention as
+ * #_create_publisher. The Subscriber entity (id 1, like the Publisher) is
+ * created lazily here on first use rather than eagerly in #initialize,
+ * since a publish-only Node has no need for one. Requests data delivery
+ * immediately (unlimited samples, no rate limiting -- fine for this MVP's
+ * single low-rate String topic) so ros2node_on_topic starts firing once
+ * #spin_once is called. Returns the DataReader's packed id, same scheme
+ * as #_create_publisher's DataWriter id. */
+static mrb_value
+mrb_ros2node_create_subscriber(mrb_state *mrb, mrb_value self)
+{
+  ros2node_data_t *data = (ros2node_data_t *)mrb_data_get_ptr(mrb, self, &ros2node_data_type);
+  mrb_value topic_name, type_name;
+  mrb_get_args(mrb, "SS", &topic_name, &type_name);
+
+  if (!data->has_subscriber) {
+    data->subscriber_id = uxr_object_id(1, UXR_SUBSCRIBER_ID);
+    uint16_t subscriber_req = uxr_buffer_create_subscriber_bin(&data->session, data->reliable_out,
+        data->subscriber_id, data->participant_id, UXR_REPLACE);
+    uint8_t status;
+    if (!uxr_run_session_until_all_status(&data->session, 1000, &subscriber_req, &status, 1)) {
+      mrb_raise(mrb, E_RUNTIME_ERROR, "ROS2::Node: failed to create subscriber");
+    }
+    data->has_subscriber = true;
+  }
+
+  uint16_t n = data->next_object_id++;
+  uxrObjectId topic_id = uxr_object_id(n, UXR_TOPIC_ID);
+  uxrObjectId datareader_id = uxr_object_id(n, UXR_DATAREADER_ID);
+
+  uint16_t topic_req = uxr_buffer_create_topic_bin(&data->session, data->reliable_out, topic_id,
+      data->participant_id, mrb_string_value_cstr(mrb, &topic_name), mrb_string_value_cstr(mrb, &type_name),
+      UXR_REPLACE);
+
+  uxrQoS_t qos = {
+    .durability = UXR_DURABILITY_VOLATILE,
+    .reliability = UXR_RELIABILITY_RELIABLE,
+    .history = UXR_HISTORY_KEEP_LAST,
+    .depth = 10,
+  };
+  uint16_t datareader_req = uxr_buffer_create_datareader_bin(&data->session, data->reliable_out, datareader_id,
+      data->subscriber_id, topic_id, qos, UXR_REPLACE);
+
+  uint16_t requests[2] = { topic_req, datareader_req };
+  uint8_t status2[2];
+  if (!uxr_run_session_until_all_status(&data->session, 1000, requests, status2, 2)) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "ROS2::Node: failed to create subscriber's topic/datareader");
+  }
+
+  uxrDeliveryControl delivery_control = { 0 };
+  delivery_control.max_samples = UXR_MAX_SAMPLES_UNLIMITED;
+  uxr_buffer_request_data(&data->session, data->reliable_out, datareader_id, data->reliable_in, &delivery_control);
+  uxr_flash_output_streams(&data->session);
+
+  return mrb_fixnum_value(((mrb_int)datareader_id.id << 8) | datareader_id.type);
+}
+
+/* Pumps the transport for up to timeout_ms: sends any buffered output,
+ * processes incoming messages (heartbeats/acks for the reliable stream,
+ * and DATA submessages -> ros2node_on_topic, which just queues them; see
+ * its comment for why). Once back here -- safely outside
+ * Micro-XRCE-DDS-Client's call stack -- drains that queue and invokes the
+ * matching #subscribe block for each entry via mrblib's #_dispatch_pending. */
+static mrb_value
+mrb_ros2node_spin_once(mrb_state *mrb, mrb_value self)
+{
+  ros2node_data_t *data = (ros2node_data_t *)mrb_data_get_ptr(mrb, self, &ros2node_data_type);
+  mrb_int timeout_ms = 0;
+  mrb_get_args(mrb, "|i", &timeout_ms);
+
+  uxr_run_session_timeout(&data->session, (int)timeout_ms);
+  mrb_funcall(mrb, self, "_dispatch_pending", 0);
+
+  return self;
+}
+
 void
 mrb_picoruby_ros2node_gem_init(mrb_state* mrb)
 {
@@ -283,6 +395,8 @@ mrb_picoruby_ros2node_gem_init(mrb_state* mrb)
   mrb_define_method_id(mrb, class_Node, MRB_SYM(initialize), mrb_ros2node_initialize, MRB_ARGS_REQ(2));
   mrb_define_method_id(mrb, class_Node, MRB_SYM(_create_publisher), mrb_ros2node_create_publisher, MRB_ARGS_REQ(2));
   mrb_define_method_id(mrb, class_Node, MRB_SYM(_write_string), mrb_ros2node_write_string, MRB_ARGS_REQ(2));
+  mrb_define_method_id(mrb, class_Node, MRB_SYM(_create_subscriber), mrb_ros2node_create_subscriber, MRB_ARGS_REQ(2));
+  mrb_define_method_id(mrb, class_Node, MRB_SYM(spin_once), mrb_ros2node_spin_once, MRB_ARGS_OPT(1));
 }
 
 void

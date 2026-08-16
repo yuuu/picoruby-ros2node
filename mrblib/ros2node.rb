@@ -8,6 +8,14 @@ module ROS2
       String => { cdr: :string, dds_type: 'std_msgs::msg::dds_::String_' }
     }
 
+    # #subscribe's type: must be given explicitly as a Symbol (e.g. :string)
+    # since the receiving side can't infer a Ruby class from wire data the
+    # way #publish infers dds_type from msg.class. Same dds_type values as
+    # TYPE_MAP above, just keyed the other way around.
+    SUBSCRIBE_TYPE_MAP = {
+      string: 'std_msgs::msg::dds_::String_'
+    }
+
     # #initialize is defined in src/mruby/ros2node.c: it wires the given
     # io (a picoruby-uart UART or a connected picoruby-socket UDPSocket,
     # detected by duck-typing) into a Micro-XRCE-DDS-Client custom
@@ -30,12 +38,31 @@ module ROS2
       end
     end
 
+    # Subscribers/DataReaders are created lazily (and cached in @readers,
+    # keyed by the Ruby-side topic name) on first subscribe to that topic,
+    # mirroring #publish/@writers. The block is looked up by the DataReader's
+    # packed id from #_dispatch_pending, called by #spin_once (defined in
+    # ros2node.c) once it's safe to do so -- see ros2node_on_topic's comment
+    # in ros2node.c for why the block isn't just called straight from there.
     def subscribe(topic, type, &block)
-      # TODO: lazily create/cache subscriber for topic, register block
+      dds_type = SUBSCRIBE_TYPE_MAP[type]
+      raise NotImplementedError, "unsupported message type: #{type.inspect}" unless dds_type
+      @readers ||= {}
+      @callbacks ||= {}
+      reader = @readers[topic] ||= _create_subscriber("rt/#{topic}", dds_type)
+      @callbacks[reader] = block
     end
 
-    def spin_once(timeout_ms = 0)
-      # TODO: non-blocking spin, invoke subscribe blocks on receipt
+    # Called by #spin_once (ros2node.c) after each uxr_run_session_timeout;
+    # not meant to be called directly.
+    def _dispatch_pending
+      pending = @pending
+      return unless pending
+      until pending.empty?
+        reader, value = pending.shift
+        cb = @callbacks && @callbacks[reader]
+        cb.call(value) if cb
+      end
     end
   end
 end
