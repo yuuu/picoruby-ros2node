@@ -3,6 +3,7 @@
 #include <mruby.h>
 #include <mruby/data.h>
 #include <mruby/string.h>
+#include <mruby/array.h>
 #include <mruby/variable.h>
 #include <mruby/presym.h>
 #include <mruby/class.h>
@@ -11,9 +12,15 @@
 #include <uxr/client/client.h>
 #include <uxr/client/util/time.h>
 
+typedef enum {
+  ROS2NODE_IO_UART, /* byte stream, e.g. picoruby-uart UART */
+  ROS2NODE_IO_UDP   /* datagram, e.g. picoruby-socket UDPSocket */
+} ros2node_io_kind;
+
 typedef struct {
   mrb_state *mrb;
-  mrb_value uart;
+  mrb_value io;
+  ros2node_io_kind io_kind;
   uxrCustomTransport transport;
   uxrSession session;
 } ros2node_data_t;
@@ -31,7 +38,7 @@ ros2node_data_free(mrb_state *mrb, void *ptr)
 static const struct mrb_data_type ros2node_data_type = { "ROS2::Node", ros2node_data_free };
 
 /*
- * The UART is opened by the caller before it reaches us, so transport
+ * io is opened/connected by the caller before it reaches us, so transport
  * open/close are no-ops; they only exist because Micro-XRCE-DDS-Client's
  * callback contract requires them.
  */
@@ -53,14 +60,17 @@ static size_t
 ros2node_transport_write(uxrCustomTransport *transport, const uint8_t *buf, size_t len, uint8_t *error_code)
 {
   ros2node_data_t *data = (ros2node_data_t *)transport->args;
-  mrb_value str = mrb_str_new(data->mrb, (const char *)buf, len);
-  mrb_value written = mrb_funcall(data->mrb, data->uart, "write", 1, str);
+  mrb_state *mrb = data->mrb;
+  mrb_value str = mrb_str_new(mrb, (const char *)buf, len);
+  const char *method = data->io_kind == ROS2NODE_IO_UART ? "write" : "send";
+  mrb_value written = mrb_funcall(mrb, data->io, method, 1, str);
   *error_code = 0;
   return mrb_integer_p(written) ? (size_t)mrb_integer(written) : 0;
 }
 
-/* UART#readpartial is non-blocking, so the timeout is enforced here by
- * polling it against uxr_millis() rather than by a blocking driver call. */
+/* Both UART#readpartial and UDPSocket#recvfrom_nonblock are non-blocking
+ * (nil if nothing is available yet), so the timeout is enforced here by
+ * polling against uxr_millis() rather than by a blocking driver call. */
 static size_t
 ros2node_transport_read(uxrCustomTransport *transport, uint8_t *buf, size_t len, int timeout_ms, uint8_t *error_code)
 {
@@ -69,7 +79,14 @@ ros2node_transport_read(uxrCustomTransport *transport, uint8_t *buf, size_t len,
   int64_t deadline = uxr_millis() + timeout_ms;
 
   for (;;) {
-    mrb_value chunk = mrb_funcall(mrb, data->uart, "readpartial", 1, mrb_fixnum_value((mrb_int)len));
+    mrb_value chunk;
+    if (data->io_kind == ROS2NODE_IO_UART) {
+      chunk = mrb_funcall(mrb, data->io, "readpartial", 1, mrb_fixnum_value((mrb_int)len));
+    } else {
+      /* [data, addr_info] on success, nil otherwise; we only need data. */
+      mrb_value result = mrb_funcall(mrb, data->io, "recvfrom_nonblock", 2, mrb_fixnum_value((mrb_int)len), mrb_fixnum_value(0));
+      chunk = mrb_array_p(result) ? mrb_ary_ref(mrb, result, 0) : result;
+    }
     if (mrb_string_p(chunk) && RSTRING_LEN(chunk) > 0) {
       size_t chunk_len = (size_t)RSTRING_LEN(chunk);
       if (chunk_len > len) chunk_len = len;
@@ -81,7 +98,7 @@ ros2node_transport_read(uxrCustomTransport *transport, uint8_t *buf, size_t len,
       *error_code = 0;
       return 0;
     }
-    mrb_funcall(mrb, data->uart, "sleep_ms", 1, mrb_fixnum_value(1));
+    mrb_funcall(mrb, data->io, "sleep_ms", 1, mrb_fixnum_value(1));
   }
 }
 
@@ -101,21 +118,37 @@ ros2node_key_from_name(const char *name, mrb_int len)
 static mrb_value
 mrb_ros2node_initialize(mrb_state *mrb, mrb_value self)
 {
-  mrb_value name, uart;
-  mrb_get_args(mrb, "So", &name, &uart);
+  mrb_value name, io;
+  mrb_get_args(mrb, "So", &name, &io);
+
+  /* recvfrom_nonblock is UDPSocket-only; check it first. UDPSocket also
+   * defines readpartial (it just raises NotImplementedError), so checking
+   * that first would misdetect every UDPSocket as a UART. */
+  ros2node_io_kind io_kind;
+  if (mrb_respond_to(mrb, io, MRB_SYM(recvfrom_nonblock))) {
+    io_kind = ROS2NODE_IO_UDP;
+  } else if (mrb_respond_to(mrb, io, MRB_SYM(readpartial))) {
+    io_kind = ROS2NODE_IO_UART;
+  } else {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "ROS2::Node: io must be a UART or a connected UDPSocket");
+  }
 
   ros2node_data_t *data = (ros2node_data_t *)mrb_malloc(mrb, sizeof(ros2node_data_t));
   memset(data, 0, sizeof(ros2node_data_t));
   data->mrb = mrb;
-  data->uart = uart;
+  data->io = io;
+  data->io_kind = io_kind;
 
   DATA_PTR(self) = data;
   DATA_TYPE(self) = &ros2node_data_type;
 
-  /* Keeps uart reachable for the GC independently of our own struct. */
-  mrb_iv_set(mrb, self, MRB_IVSYM(uart), uart);
+  /* Keeps io reachable for the GC independently of our own struct. */
+  mrb_iv_set(mrb, self, MRB_IVSYM(io), io);
 
-  uxr_set_custom_transport_callbacks(&data->transport, true,
+  /* Byte streams (UART) need COBS-style framing to find message
+   * boundaries; datagrams (UDP) are already one message per packet. */
+  bool framing = io_kind == ROS2NODE_IO_UART;
+  uxr_set_custom_transport_callbacks(&data->transport, framing,
       ros2node_transport_open, ros2node_transport_close,
       ros2node_transport_write, ros2node_transport_read);
   if (!uxr_init_custom_transport(&data->transport, data)) {

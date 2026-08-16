@@ -4,9 +4,10 @@ module ROS2
       String => :string
     }
 
-    # #initialize is defined in src/ros2node.c: it wires the given
-    # picoruby-uart UART into a Micro-XRCE-DDS-Client custom transport and
-    # establishes the session.
+    # #initialize is defined in src/mruby/ros2node.c: it wires the given
+    # io (a picoruby-uart UART or a connected picoruby-socket UDPSocket,
+    # detected by duck-typing) into a Micro-XRCE-DDS-Client custom
+    # transport and establishes the session.
 
     def publish(topic, msg)
       type = TYPE_MAP[msg.class]
